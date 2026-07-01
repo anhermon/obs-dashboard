@@ -2566,7 +2566,7 @@ async function renderRaceColumns(ids) {
     ];
     const colA = agentColor(a.agent), colB = agentColor(b.agent);
     summaryHTML = `
-      <div style="background:var(--bg3);border:1px solid var(--border);border-radius:var(--radius);padding:14px;margin-bottom:12px;overflow-x:auto">
+      <div style="background:var(--bg3);border:1px solid var(--border);border-radius:var(--radius);padding:14px;margin-bottom:12px;overflow-x:auto;flex-shrink:0">
         <div style="font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px">Head-to-Head Comparison</div>
         <table class="data-table" style="min-width:500px">
           <thead><tr>
