@@ -334,6 +334,7 @@ button.btn.danger:hover { background: #2a1010; }
   overflow: hidden;
   cursor: pointer;
   transition: border-color .15s;
+  flex-shrink: 0;
 }
 .lane:hover { border-color: var(--border2); }
 .lane.selected { border-color: var(--pi); }
@@ -1187,11 +1188,21 @@ function getPricing(modelStr) {
   return null;
 }
 
+// Agents that use subscription billing (ChatGPT OAuth, Cursor Pro, etc.) —
+// no per-token cost, so skip estimation to avoid misleading numbers.
+const SUBSCRIPTION_AGENTS = new Set(['codex', 'hermes', 'pi', 'cursor']);
+
+function isSubscriptionAgent(agent) {
+  const base = (agent||'').split(':')[0];
+  return SUBSCRIPTION_AGENTS.has(base);
+}
+
 function runCostInfo(run) {
   if (run.cost_usd && run.cost_usd > 0 && isFinite(run.cost_usd)) {
     return { cost: run.cost_usd, isEstimate: false };
   }
-  // Negative cost_usd means the DB has corrupted/adjustment data — fall through to estimate
+  // Subscription agents: no per-token billing, don't estimate
+  if (isSubscriptionAgent(run.agent)) return { cost: null, isSubscription: true };
   const p = getPricing(run.model);
   if (!p || !(run.input_tokens || run.output_tokens)) return { cost: 0, isEstimate: false };
   const cost = (run.input_tokens||0)/1e6 * p.in
@@ -1202,16 +1213,18 @@ function runCostInfo(run) {
 }
 
 function fmtRunCost(run) {
-  const { cost, isEstimate } = runCostInfo(run);
-  if (!cost && cost !== 0) return '–';
-  const s = fmtCost(cost);
-  return isEstimate ? `~${s}` : s;
+  const info = runCostInfo(run);
+  if (info.isSubscription) return 'sub';
+  if (info.cost == null) return '–';
+  const s = fmtCost(info.cost);
+  return info.isEstimate ? `~${s}` : s;
 }
 
 function runCostTitle(run) {
-  const { isEstimate } = runCostInfo(run);
-  if (!isEstimate) return 'Actual cost';
-  return `Estimated cost (${run.model||'unknown model'} via subscription — tokens × list price)`;
+  const info = runCostInfo(run);
+  if (info.isSubscription) return 'Subscription billing — no per-token cost';
+  if (!info.isEstimate) return 'Actual cost';
+  return `Estimated cost (${run.model||'unknown model'} — tokens × list price)`;
 }
 function fmtNum(n) {
   if (n == null) return '–';
@@ -1535,7 +1548,7 @@ function computeOverviewStats() {
   const runs = state.runs;
   const active = runs.filter(r => r.status === 'running').length;
   const total = runs.length;
-  const totalCost = runs.reduce((s,r) => s + (runCostInfo(r).cost||0), 0);
+  const totalCost = runs.reduce((s,r) => { const i=runCostInfo(r); return s + (i.isSubscription ? 0 : (i.cost||0)); }, 0);
   const anyEstimate = runs.some(r => runCostInfo(r).isEstimate);
   const totalTokens = runs.reduce((s,r) => s + (r.input_tokens||0) + (r.output_tokens||0), 0);
   const totalInput = runs.reduce((s,r) => s + (r.input_tokens||0), 0);
@@ -1563,7 +1576,7 @@ function renderOverviewChips() {
       <div class="label">Total Runs</div>
       <div class="value">${s.total}</div>
     </div>
-    <div class="stat-chip" title="${s.anyEstimate?'Includes estimates for subscription runs (tokens × list price)':'Actual costs'}">
+    <div class="stat-chip" title="${s.anyEstimate?'API-billed runs only — tokens × list price (subscription agents excluded)':'Actual costs'}">
       <div class="label">Total Cost${s.anyEstimate?' <span style="color:var(--text-dim);font-size:9px">~est</span>':''}</div>
       <div class="value accent">${fmtCost(s.totalCost)}</div>
     </div>
@@ -1589,8 +1602,10 @@ function renderOverviewCharts() {
   const byAgent = {};
   for (const r of runs) {
     const k = agentKey(r.agent);
-    if (!byAgent[k]) byAgent[k] = { cost:0, input:0, cached:0, reasoning:0, output:0, color: agentColor(r.agent) };
-    byAgent[k].cost += runCostInfo(r).cost||0;
+    if (!byAgent[k]) byAgent[k] = { cost:0, input:0, cached:0, reasoning:0, output:0, color: agentColor(r.agent), sub: false };
+    const ci = runCostInfo(r);
+    byAgent[k].sub = byAgent[k].sub || !!ci.isSubscription;
+    byAgent[k].cost += ci.isSubscription ? 0 : (ci.cost||0);
     byAgent[k].input += r.input_tokens||0;
     byAgent[k].cached += r.cache_read_tokens||0;
     byAgent[k].reasoning += r.reasoning_tokens||0;
@@ -1624,7 +1639,7 @@ function renderOverviewCharts() {
       html += `
         <rect x="${padL}" y="${y}" width="${Math.max(barW,2)}" height="${barH}" fill="${col}" rx="3" opacity=".85"/>
         <text x="${padL-6}" y="${y+barH/2+4}" text-anchor="end" fill="#8899aa" font-size="11" font-family="var(--font)">${a}</text>
-        <text x="${padL+barW+5}" y="${y+barH/2+4}" fill="#c9d1e0" font-size="11" font-family="var(--font)">${fmtCost(val)}</text>
+        <text x="${padL+barW+5}" y="${y+barH/2+4}" fill="${byAgent[a].sub?'#5a6377':'#c9d1e0'}" font-size="11" font-family="var(--font)">${byAgent[a].sub?'sub':fmtCost(val)}</text>
       `;
     });
     $costSvg.innerHTML = html;
