@@ -185,6 +185,17 @@ const analyticsStmts = {
     WHERE started_at >= ?
     GROUP BY date ORDER BY date ASC
   `),
+  tokensByModel: db.prepare(`
+    SELECT agent, model,
+      COALESCE(SUM(input_tokens), 0) AS input_tokens,
+      COALESCE(SUM(output_tokens), 0) AS output_tokens,
+      COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+      COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
+      COALESCE(SUM(CASE WHEN cost_usd > 0 THEN cost_usd ELSE 0 END), 0) AS stored_cost_usd
+    FROM runs
+    WHERE input_tokens > 0 OR output_tokens > 0
+    GROUP BY agent, model
+  `),
   agentSummary: db.prepare(`
     SELECT
       agent,
@@ -347,10 +358,65 @@ function totalTokensForRow(r) {
     (r.reasoning_tokens || 0);
 }
 
+// Agents billed via external subscription (no per-token cost to estimate)
+const SUBSCRIPTION_AGENTS_SERVER = new Set(['codex', 'hermes', 'pi', 'cursor']);
 function isSubscriptionAgent(agent) {
-  // claude-code runs under Anthropic Pro/Max subscription — cost_usd not meaningful
-  return agent === 'claude-code' || agent.startsWith('claude-code:') ||
-    agent === 'claude-code:subagent';
+  const base = (agent || '').split(':')[0];
+  return SUBSCRIPTION_AGENTS_SERVER.has(base);
+}
+
+// $/1M tokens
+const MODEL_PRICING = {
+  'claude-opus-4':     { in: 15,   out: 75,   cr: 1.50  },
+  'claude-opus-4-8':   { in: 15,   out: 75,   cr: 1.50  },
+  'claude-sonnet-5':   { in: 3,    out: 15,   cr: 0.30  },
+  'claude-sonnet-4-6': { in: 3,    out: 15,   cr: 0.30  },
+  'claude-sonnet-4':   { in: 3,    out: 15,   cr: 0.30  },
+  'claude-3-5-sonnet': { in: 3,    out: 15,   cr: 0.30  },
+  'claude-3-opus':     { in: 15,   out: 75,   cr: 1.50  },
+  'claude-haiku-4-5':  { in: 0.8,  out: 4,    cr: 0.08  },
+  'claude-3-haiku':    { in: 0.25, out: 1.25, cr: 0.03  },
+  'gpt-4o':            { in: 2.5,  out: 10,   cr: 1.25  },
+  'gpt-4o-mini':       { in: 0.15, out: 0.60, cr: 0.075 },
+  'o1':                { in: 15,   out: 60,   cr: 7.50  },
+  'o3-mini':           { in: 1.1,  out: 4.4,  cr: 0.55  },
+};
+
+function getPricingForModel(model) {
+  if (!model) return null;
+  const m = model.toLowerCase().replace(/\s+/g, '-');
+  for (const [k, v] of Object.entries(MODEL_PRICING)) {
+    if (m.startsWith(k) || m.includes(k)) return v;
+  }
+  if (m.includes('opus'))   return MODEL_PRICING['claude-opus-4'];
+  if (m.includes('sonnet')) return MODEL_PRICING['claude-sonnet-4'];
+  if (m.includes('haiku'))  return MODEL_PRICING['claude-haiku-4-5'];
+  if (m.includes('gpt-4o-mini')) return MODEL_PRICING['gpt-4o-mini'];
+  if (m.includes('gpt-4'))  return MODEL_PRICING['gpt-4o'];
+  return null;
+}
+
+function estimateCostUsd(input, output, cacheRead) {
+  return (input * 0 + output * 0 + cacheRead * 0); // placeholder; see estimateCostForModelRows
+}
+
+// Estimate total cost from per-model aggregated rows
+function estimateCostForModelRows(rows, agentFilter) {
+  let total = 0;
+  for (const r of rows) {
+    if (agentFilter && r.agent !== agentFilter) continue;
+    if (isSubscriptionAgent(r.agent)) continue;
+    const p = getPricingForModel(r.model);
+    if (!p) continue;
+    const M = 1_000_000;
+    const stored = r.stored_cost_usd || 0;
+    const est = (r.input_tokens / M * p.in)
+              + (r.output_tokens / M * p.out)
+              + (r.cache_read_tokens / M * p.cr)
+              + (r.cache_write_tokens / M * p.in * 1.25);
+    total += Math.max(stored, est);
+  }
+  return total;
 }
 
 function buildOptimizationInsights(total, byAgent) {
@@ -425,6 +491,9 @@ app.get('/api/summary', (_req, res) => {
   const cutoff14d = Date.now() - 14 * 24 * 60 * 60 * 1000;
 
   const raw = analyticsStmts.totalStats.get();
+  const modelRows = analyticsStmts.tokensByModel.all();
+  const totalEstCost = estimateCostForModelRows(modelRows);
+
   const total = {
     runs: raw.runs,
     sessions_with_tokens: raw.sessions_with_tokens,
@@ -435,25 +504,30 @@ app.get('/api/summary', (_req, res) => {
     reasoning_tokens: raw.reasoning_tokens,
     total_tokens: totalTokensForRow(raw),
     cache_hit_rate_pct: cacheHitRate(raw.cache_read_tokens, raw.input_tokens, raw.cache_write_tokens),
-    cost_usd: raw.cost_usd,
+    cost_usd: totalEstCost,
     active_runs: raw.active_runs,
   };
 
   const byAgentRaw = analyticsStmts.byAgentDetailed.all();
-  const by_agent = byAgentRaw.map(r => ({
-    agent: r.agent,
-    runs: r.runs,
-    input_tokens: r.input_tokens,
-    output_tokens: r.output_tokens,
-    cache_read_tokens: r.cache_read_tokens,
-    cache_write_tokens: r.cache_write_tokens,
-    reasoning_tokens: r.reasoning_tokens,
-    total_tokens: totalTokensForRow(r),
-    cache_hit_rate_pct: cacheHitRate(r.cache_read_tokens, r.input_tokens, r.cache_write_tokens),
-    cost_usd: r.cost_usd,
-    active_runs: r.active_runs,
-    is_subscription: isSubscriptionAgent(r.agent),
-  }));
+  const by_agent = byAgentRaw.map(r => {
+    const agentEstCost = isSubscriptionAgent(r.agent)
+      ? 0
+      : estimateCostForModelRows(modelRows, r.agent);
+    return {
+      agent: r.agent,
+      runs: r.runs,
+      input_tokens: r.input_tokens,
+      output_tokens: r.output_tokens,
+      cache_read_tokens: r.cache_read_tokens,
+      cache_write_tokens: r.cache_write_tokens,
+      reasoning_tokens: r.reasoning_tokens,
+      total_tokens: totalTokensForRow(r),
+      cache_hit_rate_pct: cacheHitRate(r.cache_read_tokens, r.input_tokens, r.cache_write_tokens),
+      cost_usd: agentEstCost,
+      active_runs: r.active_runs,
+      is_subscription: isSubscriptionAgent(r.agent),
+    };
+  });
 
   const top_cache_consumers = analyticsStmts.topCacheConsumers.all().map(r => ({
     ...r,

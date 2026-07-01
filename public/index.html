@@ -1547,11 +1547,16 @@ function renderAll() {
 /* ══════════════════════════════════════════════════════════
    OVERVIEW
 ══════════════════════════════════════════════════════════ */
-function renderOverview() {
-  renderOverviewChips();
+async function renderOverview() {
+  renderOverviewChips();   // immediate render from state (no flicker)
   renderOverviewCharts();
   renderRecentRuns();
   renderRtkCard();
+  // Refresh chips from full-DB summary (accurate totals regardless of state.runs limit)
+  try {
+    const s = await fetch('/api/summary').then(r => r.json());
+    renderOverviewChipsFromSummary(s);
+  } catch { /* keep state.runs version */ }
 }
 
 async function renderRtkCard() {
@@ -1609,35 +1614,83 @@ function computeOverviewStats() {
 
 function renderOverviewChips() {
   const s = computeOverviewStats();
+  _paintChips(s.active, s.total, s.totalCost, true, s.totalTokens, s.cacheHit, s.cacheSavedUsd, s.avgTps);
+}
+
+function renderOverviewChipsFromSummary(api) {
+  const s = computeOverviewStats();   // still need active + avgTps from local state
+  const t = api.total;
+  const totalTokens = (t.input_tokens||0) + (t.output_tokens||0);
+  const cacheRead = t.cache_read_tokens || 0;
+  const cacheHit = (totalTokens + cacheRead) > 0
+    ? ((cacheRead / (totalTokens + cacheRead)) * 100).toFixed(1)
+    : '–';
+  // Cache savings: sum across non-subscription agents
+  let cacheSavedUsd = 0;
+  for (const a of (api.by_agent || [])) {
+    if (a.is_subscription || !a.cache_read_tokens) continue;
+    // server already estimated cost; derive savings from model pricing via fetch data
+    // approximation: use global cowork/codex etc rates not available here → skip for those
+    // Good-enough: pull from api.cache_efficiency_by_agent if present
+  }
+  // Use server's estimated cost directly
+  _paintChips(s.active, t.runs, t.cost_usd, true, totalTokens, cacheHit, null, s.avgTps, api);
+}
+
+function _paintChips(active, total, totalCost, anyEstimate, totalTokens, cacheHit, cacheSavedUsd, avgTps, api) {
+  // Cache savings: from state.runs when no api, from api when provided
+  let savedStr = '–';
+  if (api) {
+    // compute savings per agent using their model data from api.by_agent
+    let saved = 0;
+    for (const a of (api.by_agent || [])) {
+      if (a.is_subscription || !a.cache_read_tokens) continue;
+      // Use stored cost_usd as proxy for billing; estimate savings from input vs cache_read price
+      // Without per-model pricing on each agent here, skip detailed calc — use 70% of cost as proxy
+      // Actually: cache savings = total_input_cost * (1 - cr/in_price_ratio)
+      // This is too imprecise without per-model data; use CLI formula from state.runs
+    }
+    // Fall back to state.runs calculation for cache saved
+    const runs = state.runs;
+    for (const r of runs) {
+      if (!(r.cache_read_tokens > 0) || isSubscriptionAgent(r.agent)) continue;
+      const p = getPricing(r.model);
+      if (p) saved += (r.cache_read_tokens / 1e6) * (p.in - p.cr);
+    }
+    savedStr = saved > 0 ? '~'+fmtCost(saved) : '–';
+  } else if (cacheSavedUsd != null) {
+    savedStr = cacheSavedUsd > 0 ? '~'+fmtCost(cacheSavedUsd) : '–';
+  }
+
   const $c = document.getElementById('overview-chips');
   $c.innerHTML = `
     <div class="stat-chip">
       <div class="label">Active</div>
-      <div class="value${s.active>0?' green':''}">${s.active}</div>
+      <div class="value${active>0?' green':''}">${active}</div>
     </div>
     <div class="stat-chip">
       <div class="label">Total Runs</div>
-      <div class="value">${s.total}</div>
+      <div class="value">${total}</div>
     </div>
-    <div class="stat-chip" title="${s.anyEstimate?'API-billed runs only — tokens × list price (subscription agents excluded)':'Actual costs'}">
-      <div class="label">Total Cost${s.anyEstimate?' <span style="color:var(--text-dim);font-size:9px">~est</span>':''}</div>
-      <div class="value accent">${fmtCost(s.totalCost)}</div>
+    <div class="stat-chip" title="API-billed runs only — tokens × list price (subscription agents excluded)">
+      <div class="label">Total Cost <span style="color:var(--text-dim);font-size:9px">~est</span></div>
+      <div class="value accent">${fmtCost(totalCost)}</div>
     </div>
     <div class="stat-chip">
       <div class="label">Total Tokens</div>
-      <div class="value">${fmtNum(s.totalTokens)}</div>
+      <div class="value">${fmtNum(totalTokens)}</div>
     </div>
     <div class="stat-chip">
       <div class="label">Cache Hit %</div>
-      <div class="value orange">${s.cacheHit}${s.cacheHit!=='–'?'%':''}</div>
+      <div class="value orange">${cacheHit}${cacheHit!=='–'?'%':''}</div>
     </div>
-    <div class="stat-chip" title="Estimated savings: cached reads billed at cache price vs fresh input price (cache_read_tokens × (input_price − cache_read_price))">
+    <div class="stat-chip" title="Estimated savings: cached reads billed at cache price vs fresh input price">
       <div class="label">Cache Saved <span style="color:var(--text-dim);font-size:9px">~est</span></div>
-      <div class="value teal">${s.cacheSavedUsd > 0 ? '~'+fmtCost(s.cacheSavedUsd) : '–'}</div>
+      <div class="value teal">${savedStr}</div>
     </div>
     <div class="stat-chip">
       <div class="label">Avg tok/s</div>
-      <div class="value">${s.avgTps}</div>
+      <div class="value">${avgTps}</div>
     </div>
   `;
 }
