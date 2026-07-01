@@ -736,8 +736,7 @@ table.data-table tr.expandable { cursor: pointer; }
   border-bottom: 1px solid var(--border);
 }
 .event-feed {
-  max-height: 400px;
-  overflow-y: auto;
+  overflow-y: visible;
 }
 .ev-row {
   display: flex;
@@ -1034,8 +1033,8 @@ select.multi-select option:checked { background: var(--pi-dim); }
             <tr>
               <th data-sort="name">Tool <span class="sort-indicator">↕</span></th>
               <th data-sort="calls">Calls <span class="sort-indicator">↕</span></th>
-              <th data-sort="avg_dur">Avg ms <span class="sort-indicator">↕</span></th>
-              <th data-sort="total_dur">Total ms <span class="sort-indicator">↕</span></th>
+              <th data-sort="avg_dur">Avg dur <span class="sort-indicator">↕</span></th>
+              <th data-sort="total_dur">Total dur <span class="sort-indicator">↕</span></th>
               <th>Agents</th>
             </tr>
           </thead>
@@ -1072,6 +1071,7 @@ select.multi-select option:checked { background: var(--pi-dim); }
 const state = {
   runs: [],          // array of run objects
   runEvents: {},     // run_id → array of event objects (lazily loaded)
+  runEventsLoaded: new Set(), // run_ids whose full history has been fetched
   analytics: null,   // cached analytics response
   activeTab: 'overview',
   selectedRunId: null,
@@ -1386,6 +1386,7 @@ function handleWsMessage(msg) {
   if (msg.type === 'clear') {
     state.runs = [];
     state.runEvents = {};
+    state.runEventsLoaded = new Set();
     state.analytics = null;
     renderAll();
     return;
@@ -1415,7 +1416,7 @@ function handleWsMessage(msg) {
         state.runEvents[ev.run_id].push(ev);
       }
     }
-    renderActive();
+    debouncedRenderActive();
     return;
   }
 }
@@ -1442,13 +1443,19 @@ async function loadAnalytics() {
 }
 
 async function loadRunEvents(runId) {
-  if (state.runEvents[runId]) return state.runEvents[runId];
+  if (state.runEventsLoaded.has(runId)) return state.runEvents[runId] || [];
   try {
     const r = await fetch('/api/runs/' + runId + '/events');
     if (!r.ok) return [];
-    const data = await r.json();
-    state.runEvents[runId] = data;
-    return data;
+    const fetched = await r.json();
+    // Merge with any WS-pushed events that arrived while the fetch was in flight
+    const ws_pending = state.runEvents[runId] || [];
+    const seen = new Set(fetched.map(e => e.seq));
+    const merged = [...fetched, ...ws_pending.filter(e => !seen.has(e.seq))];
+    merged.sort((a, b) => a.seq - b.seq);
+    state.runEvents[runId] = merged;
+    state.runEventsLoaded.add(runId);
+    return merged;
   } catch { return []; }
 }
 
@@ -1458,6 +1465,7 @@ async function clearRuns() {
     await fetch('/api/runs', { method: 'DELETE' });
     state.runs = [];
     state.runEvents = {};
+    state.runEventsLoaded = new Set();
     state.analytics = null;
     renderAll();
   } catch {}
@@ -1491,13 +1499,9 @@ async function switchTab(tab) {
 
 function autoSelectRaceRuns() {
   const $sel = document.getElementById('race-select');
-  // Pick top-2 runs with the most actual token data (skip empty stubs)
-  const sorted = [...state.runs].sort((a, b) => {
-    const ta = (a.input_tokens||0) + (a.output_tokens||0) + (a.cache_read_tokens||0);
-    const tb = (b.input_tokens||0) + (b.output_tokens||0) + (b.cache_read_tokens||0);
-    return tb - ta;
-  });
-  const top2 = sorted.slice(0, 2).map(r => r.id);
+  // Pick 2 most recent runs that have token data
+  const withTokens = state.runs.filter(r => (r.input_tokens||0) + (r.output_tokens||0) > 0);
+  const top2 = withTokens.slice(0, 2).map(r => r.id);
   setTimeout(() => {
     for (const opt of $sel.options) {
       opt.selected = top2.includes(opt.value);
@@ -1514,6 +1518,13 @@ function renderActive() {
     case 'race':     renderRaceSelect(); break;
   }
 }
+
+let _renderDebounceTimer = null;
+function debouncedRenderActive() {
+  clearTimeout(_renderDebounceTimer);
+  _renderDebounceTimer = setTimeout(renderActive, 80);
+}
+
 function renderAll() {
   renderActive();
 }
@@ -1598,7 +1609,7 @@ function renderOverviewChips() {
       <div class="value orange">${s.cacheHit}${s.cacheHit!=='–'?'%':''}</div>
     </div>
     <div class="stat-chip">
-      <div class="label">Avg t/s</div>
+      <div class="label">Avg tok/s</div>
       <div class="value">${s.avgTps}</div>
     </div>
   `;
@@ -1645,9 +1656,11 @@ function renderOverviewCharts() {
       const barW = (val / maxCost) * bw;
       const y = padT + i * (barH + gap);
       const col = byAgent[a].color;
+      const tip = byAgent[a].sub ? `${a} — subscription billing` : `${a} — ${fmtCost(val)} (${byAgent[a].calls||'?'} runs)`;
       html += `
-        <rect x="${padL}" y="${y}" width="${Math.max(barW,2)}" height="${barH}" fill="${col}" rx="3" opacity=".85"/>
-        <text x="${padL-6}" y="${y+barH/2+4}" text-anchor="end" fill="#8899aa" font-size="11" font-family="var(--font)">${a}</text>
+        <rect x="${padL}" y="${y}" width="${Math.max(barW,2)}" height="${barH}" fill="${col}" rx="3" opacity=".85"
+              onmouseenter="showTip('${escAttr(tip)}',event)" onmouseleave="hideTip()"/>
+        <text x="${padL-6}" y="${y+barH/2+4}" text-anchor="end" fill="#8899aa" font-size="11" font-family="var(--font)">${escHtml(a)}</text>
         <text x="${padL+barW+5}" y="${y+barH/2+4}" fill="${byAgent[a].sub?'#5a6377':'#c9d1e0'}" font-size="11" font-family="var(--font)">${byAgent[a].sub?'sub':fmtCost(val)}</text>
       `;
     });
@@ -1685,19 +1698,20 @@ function renderOverviewCharts() {
       html += `<text x="${padL-6}" y="${y+barH/2+4}" text-anchor="end" fill="#8899aa" font-size="11" font-family="var(--font)">${a}</text>`;
 
       if (cachedW > 0) {
-        html += `<rect x="${x}" y="${y}" width="${Math.max(cachedW,0)}" height="${barH}" fill="#2a4070" rx="0"/>`;
+        html += `<rect x="${x}" y="${y}" width="${Math.max(cachedW,0)}" height="${barH}" fill="#2a4070" rx="0" onmouseenter="showTip('${escAttr(a)} cached: ${escAttr(fmtNum(d.cached))}',event)" onmouseleave="hideTip()"/>`;
         x += cachedW;
       }
       if (freshW > 0) {
-        html += `<rect x="${x}" y="${y}" width="${Math.max(freshW,0)}" height="${barH}" fill="${col}" rx="0"/>`;
+        const fresh = d.input - d.cached - d.reasoning;
+        html += `<rect x="${x}" y="${y}" width="${Math.max(freshW,0)}" height="${barH}" fill="${col}" rx="0" onmouseenter="showTip('${escAttr(a)} fresh input: ${escAttr(fmtNum(fresh))}',event)" onmouseleave="hideTip()"/>`;
         x += freshW;
       }
       if (reasonW > 0) {
-        html += `<rect x="${x}" y="${y}" width="${Math.max(reasonW,0)}" height="${barH}" fill="#f97b4f" rx="0"/>`;
+        html += `<rect x="${x}" y="${y}" width="${Math.max(reasonW,0)}" height="${barH}" fill="#f97b4f" rx="0" onmouseenter="showTip('${escAttr(a)} reasoning: ${escAttr(fmtNum(d.reasoning))}',event)" onmouseleave="hideTip()"/>`;
         x += reasonW;
       }
       if (outW > 0) {
-        html += `<rect x="${x}" y="${y}" width="${Math.max(outW,0)}" height="${barH}" fill="#4fbd72" rx="0" opacity=".7"/>`;
+        html += `<rect x="${x}" y="${y}" width="${Math.max(outW,0)}" height="${barH}" fill="#4fbd72" rx="0" opacity=".7" onmouseenter="showTip('${escAttr(a)} output: ${escAttr(fmtNum(d.output))}',event)" onmouseleave="hideTip()"/>`;
         x += outW;
       }
       // Round first and last
@@ -1735,11 +1749,11 @@ function renderRecentRuns() {
     const pct = ((r.duration_ms||0) / maxDur * 100).toFixed(1);
     const col = agentColor(r.agent);
     return `
-      <div class="run-row" onclick="openSession('${r.id}')">
+      <div class="run-row" data-run-id="${escAttr(r.id)}" onclick="openSession(this.dataset.runId)">
         <div class="dur-bar" style="width:${pct}%"></div>
         <div class="status-dot ${runDisplayStatus(r)}"></div>
-        <div class="agent-badge" style="background:${agentDim(r.agent)};color:${col}">${agentLabel(r.agent)}</div>
-        <div class="run-label">${r.label || r.id}</div>
+        <div class="agent-badge" style="background:${agentDim(r.agent)};color:${col}">${escHtml(agentLabel(r.agent))}</div>
+        <div class="run-label">${escHtml(r.label || r.id)}</div>
         <div class="run-meta">
           <span>${fmtTs(r.started_at)}</span>
           <span class="hi">${fmtDur(r.duration_ms)}</span>
@@ -1809,12 +1823,12 @@ function buildLaneHTML(r) {
   const events = state.runEvents[r.id] || [];
   const timelineHTML = buildTimeline(r, events);
   return `
-    <div class="lane${state.selectedRunId===r.id?' selected':''}" id="lane-${r.id}" onclick="openSession('${r.id}')">
+    <div class="lane${state.selectedRunId===r.id?' selected':''}" id="lane-${escAttr(r.id)}" data-run-id="${escAttr(r.id)}" onclick="openSession(this.dataset.runId)">
       <div class="lane-hdr">
         <div class="status-dot ${runDisplayStatus(r)}"></div>
-        <div class="agent-badge" style="background:${agentDim(r.agent)};color:${col}">${agentLabel(r.agent)}</div>
-        <div class="run-label">${r.label || r.id}</div>
-        <div class="lane-model">${r.model || ''}</div>
+        <div class="agent-badge" style="background:${agentDim(r.agent)};color:${col}">${escHtml(agentLabel(r.agent))}</div>
+        <div class="run-label">${escHtml(r.label || r.id)}</div>
+        <div class="lane-model">${escHtml(r.model || '')}</div>
         <div class="lane-stats">
           <span>T:<span class="hi">${r.turn_count||0}</span></span>
           <span>🔧<span class="hi">${r.tool_call_count||0}</span></span>
@@ -1850,13 +1864,13 @@ function buildTimeline(r, events) {
 }
 
 function showTipForBlock(e, el) {
-  const t = el.dataset.type || '';
-  const s = el.dataset.summary || '';
+  const t = escHtml(el.dataset.type || '');
+  const s = escHtml(el.dataset.summary || '');
   showTip(`<div class="tt-title">${t}</div><div class="tt-line">${s}</div>`, e);
 }
 
 function escAttr(s) {
-  return (s||'').replace(/"/g, '&quot;').replace(/</g,'&lt;');
+  return (s||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
 // Lane mode toggle
@@ -1878,23 +1892,18 @@ function renderSessionSidebar() {
     $list.innerHTML = '<div class="no-data" style="padding:12px">No runs yet</div>';
     return;
   }
-  // Sort: runs with tokens first, then by recency
-  const sidebarRuns = [...state.runs].sort((a, b) => {
-    const ta = (a.input_tokens||0) + (a.output_tokens||0) + (a.cache_read_tokens||0);
-    const tb = (b.input_tokens||0) + (b.output_tokens||0) + (b.cache_read_tokens||0);
-    if (tb !== ta) return tb - ta;
-    return (b.started_at||0) - (a.started_at||0);
-  });
+  // Sort by recency so freshly-started runs appear at top
+  const sidebarRuns = [...state.runs].sort((a, b) => (b.started_at||0) - (a.started_at||0));
   $list.innerHTML = sidebarRuns.map(r => {
     const col = agentColor(r.agent);
     const totalTok = (r.input_tokens||0)+(r.output_tokens||0);
     return `
-      <div class="sidebar-run${state.selectedRunId===r.id?' active':''}" onclick="selectSessionRun('${r.id}')">
+      <div class="sidebar-run${state.selectedRunId===r.id?' active':''}" data-run-id="${escAttr(r.id)}" onclick="selectSessionRun(this.dataset.runId)">
         <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
           <div class="status-dot ${runDisplayStatus(r)}"></div>
-          <div class="agent-badge" style="background:${agentDim(r.agent)};color:${col};font-size:9px">${agentLabel(r.agent)}</div>
+          <div class="agent-badge" style="background:${agentDim(r.agent)};color:${col};font-size:9px">${escHtml(agentLabel(r.agent))}</div>
         </div>
-        <div class="sr-label">${r.label || r.id}</div>
+        <div class="sr-label">${escHtml(r.label || r.id)}</div>
         <div class="sr-stats">
           <span>T:${r.turn_count||0}</span>
           <span>🔧${r.tool_call_count||0}</span>
@@ -1908,6 +1917,7 @@ function renderSessionSidebar() {
 async function selectSessionRun(id) {
   state.selectedRunId = id;
   renderSessionSidebar();
+  document.querySelector(`.sidebar-run.active`)?.scrollIntoView({ block: 'nearest' });
   await renderSessionMain(id);
 }
 
@@ -1952,8 +1962,8 @@ async function renderSessionMain(runId) {
     const freshPct  = (fresh/cwSize*100).toFixed(1);
     const reasonPct = (totalReason/cwSize*100).toFixed(1);
     const outPct    = (totalOut/cwSize*100).toFixed(1);
-    const usedPct   = ((totalIn+totalOut)/cwSize*100).toFixed(1);
-    const free      = Math.max(0, cwSize - totalIn - totalOut);
+    const usedPct   = (totalIn/cwSize*100).toFixed(1);
+    const free      = Math.max(0, cwSize - totalIn);
     gaugeHTML = `
       <div class="ctx-gauge-wrap">
         <div class="ctx-gauge-hdr">
@@ -1967,7 +1977,7 @@ async function renderSessionMain(runId) {
           <div class="ctx-seg output"   style="width:${outPct}%"    title="output ${fmtNum(totalOut)}"></div>
         </div>
         <div class="ctx-gauge-labels">
-          ${usedPct}% used · ${fmtNum(totalCached)}k cached (${cachedPct}%) · ${fmtNum(totalReason)} reasoning · ${fmtNum(free)} free
+          ${usedPct}% input used · ${fmtNum(totalCached)} cached (${cachedPct}%) · ${fmtNum(totalReason)} reasoning · ${fmtNum(free)} free
         </div>
       </div>`;
   }
@@ -2224,7 +2234,7 @@ function buildTokenFlowHTML(run, events) {
         turn: currentTurn,
         input:    u.input_tokens||0,
         output:   u.output_tokens||0,
-        cached:   u.cache_read_input_tokens||0,
+        cached:   u.cache_read_input_tokens || u.cached_input_tokens || 0,
         reasoning:u.reasoning_tokens||0,
       });
     }
@@ -2410,8 +2420,8 @@ function renderTools() {
       <tr>
         <td style="color:var(--yellow)">${t.name}</td>
         <td>${t.calls||0}</td>
-        <td>${t.avg_dur != null ? Math.round(t.avg_dur) : '–'}</td>
-        <td>${t.total_dur != null ? Math.round(t.total_dur) : '–'}</td>
+        <td>${t.avg_dur != null ? fmtMs(t.avg_dur) : '–'}</td>
+        <td>${t.total_dur != null ? fmtMs(t.total_dur) : '–'}</td>
         <td>${agentBadges}</td>
       </tr>`;
   }).join('');

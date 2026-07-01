@@ -64,6 +64,12 @@ for (const [col, def] of Object.entries(newCols)) {
   }
 }
 
+// Safe columns for list endpoints — excludes system_prompt and working_dir
+const RUN_SAFE_COLS = `id, agent, label, model, started_at, ended_at, duration_ms,
+  turn_count, event_count, tool_call_count,
+  input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+  reasoning_tokens, cost_usd, context_window_size, status`;
+
 const stmts = {
   upsertRun: db.prepare(`
     INSERT INTO runs (id, agent, label, model, started_at, status, system_prompt, working_dir)
@@ -93,8 +99,9 @@ const stmts = {
   incrementToolCalls:db.prepare(`UPDATE runs SET tool_call_count = tool_call_count + 1 WHERE id = ?`),
   incrementEvents:   db.prepare(`UPDATE runs SET event_count = event_count + 1 WHERE id = ?`),
   insertEvent:       db.prepare(`INSERT INTO events (run_id, type, ts, seq, data) VALUES (?, ?, ?, ?, ?)`),
-  getRuns:           db.prepare(`SELECT * FROM runs ORDER BY started_at DESC LIMIT 200`),
+  getRuns:           db.prepare(`SELECT ${RUN_SAFE_COLS} FROM runs ORDER BY started_at DESC LIMIT 200`),
   getRun:            db.prepare(`SELECT * FROM runs WHERE id = ?`),
+  getRunSafe:        db.prepare(`SELECT ${RUN_SAFE_COLS} FROM runs WHERE id = ?`),
   getEvents:         db.prepare(`SELECT * FROM events WHERE run_id = ? ORDER BY seq ASC`),
   getRunSeq:         db.prepare(`SELECT COALESCE(MAX(seq), -1) + 1 AS next_seq FROM events WHERE run_id = ?`),
 };
@@ -133,7 +140,7 @@ const analyticsStmts = {
       AND json_extract(data,'$.tool_name') IS NOT NULL
     GROUP BY tool_name ORDER BY total_dur_ms DESC LIMIT 30
   `),
-  recentRuns: db.prepare(`SELECT * FROM runs ORDER BY started_at DESC LIMIT 20`),
+  recentRuns: db.prepare(`SELECT ${RUN_SAFE_COLS} FROM runs ORDER BY started_at DESC LIMIT 20`),
 };
 
 // --- Event processor ---
@@ -174,11 +181,9 @@ function processEvent(raw) {
   if (type === 'tool_execution_start' || type === 'tool_call_start' || type === 'pretooluse')
     stmts.incrementToolCalls.run(run_id);
 
-  // model_select: record the model switch
   if (type === 'model_select' && data.model)
     stmts.updateModel.run(data.model, run_id);
 
-  // before_provider_request: use approx tokens for context window if no exact count yet
   if (type === 'before_provider_request' && data.approx_input_tokens)
     stmts.updateContextWin.run(data.approx_input_tokens, run_id, data.approx_input_tokens);
 
@@ -201,7 +206,8 @@ function processEvent(raw) {
   if (type === 'session_end' || type === 'agent_end')
     stmts.endRun.run(ts, ts, run_id);
 
-  return { run_id, event: { id: seq, run_id, type, ts, seq, data }, run: stmts.getRun.get(run_id) };
+  // Strip sensitive columns before broadcasting
+  return { run_id, event: { id: seq, run_id, type, ts, seq, data }, run: stmts.getRunSafe.get(run_id) };
 }
 
 // --- HTTP + WebSocket ---
@@ -218,6 +224,7 @@ function broadcast(msg) {
 app.post('/api/events', (req, res) => {
   try {
     const items = Array.isArray(req.body) ? req.body : [req.body];
+    if (items.length > 100) return res.status(429).json({ error: 'batch too large (max 100 events)' });
     const results = items.map(processEvent);
     broadcast({ type: 'batch', events: results });
     res.json({ ok: true, processed: results.length });
@@ -237,7 +244,8 @@ app.get('/api/runs/:id', (req, res) => {
 
 app.get('/api/runs/:id/events', (req, res) => {
   const evs = stmts.getEvents.all(req.params.id).map(e => ({
-    ...e, data: e.data ? JSON.parse(e.data) : {}
+    ...e,
+    data: (() => { try { return e.data ? JSON.parse(e.data) : {}; } catch { return {}; } })(),
   }));
   res.json(evs);
 });
@@ -252,7 +260,7 @@ app.get('/api/analytics', (_req, res) => {
 });
 
 app.delete('/api/runs', (_req, res) => {
-  db.exec('DELETE FROM events; DELETE FROM runs;');
+  db.exec('BEGIN; DELETE FROM events; DELETE FROM runs; COMMIT;');
   broadcast({ type: 'clear' });
   res.json({ ok: true });
 });
@@ -290,9 +298,10 @@ wss.on('connection', ws => {
   wsClients.add(ws);
   ws.send(JSON.stringify({ type: 'init', runs: stmts.getRuns.all() }));
   ws.on('close', () => wsClients.delete(ws));
+  ws.on('error', () => wsClients.delete(ws));
 });
 
-server.listen(PORT, () => {
+server.listen(PORT, '127.0.0.1', () => {
   console.log(`\n🔭  Obs Dashboard  →  http://localhost:${PORT}\n`);
   console.log('POST /api/events    — receive events');
   console.log('GET  /api/analytics — aggregate stats');

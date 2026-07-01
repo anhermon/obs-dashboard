@@ -115,6 +115,12 @@ function processLine(filePath, raw) {
     }
 
     if (sub === 'mcp_tool_call_end') {
+      // Emit start (increments tool_call_count) then end (captures duration)
+      postEvent('codex', sessionId, 'tool_execution_start', {
+        tool_name: p.invocation?.tool,
+        tool_call_id: p.call_id,
+        server: p.invocation?.server,
+      });
       postEvent('codex', sessionId, 'tool_execution_end', {
         tool_name: p.invocation?.tool,
         tool_call_id: p.call_id,
@@ -151,8 +157,12 @@ function tailFile(filePath) {
   let buf = '';
   stream.on('data', chunk => { buf += chunk; });
   stream.on('end', () => {
-    filePositions.set(filePath, stat.size);
     const lines = buf.split('\n');
+    // Last segment may be a partial line if file was mid-write; don't consume it yet
+    const partial = lines[lines.length - 1];
+    if (partial.trim()) lines.pop(); else lines.pop();
+    const consumed = buf.length - partial.length;
+    filePositions.set(filePath, offset + consumed);
     for (const line of lines) {
       const trimmed = line.trim();
       if (trimmed) processLine(filePath, trimmed);
