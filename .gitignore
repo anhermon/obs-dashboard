@@ -1,0 +1,6 @@
+node_modules/
+
+# SQLite database files (runtime data, not versioned)
+*.db
+*.db-shm
+*.db-wal
