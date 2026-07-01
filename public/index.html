@@ -195,6 +195,7 @@ button.btn.danger:hover { background: #2a1010; }
 .stat-chip .value.accent { color: var(--pi); }
 .stat-chip .value.green  { color: var(--green); }
 .stat-chip .value.orange { color: var(--orange); }
+.stat-chip .value.teal   { color: var(--teal); }
 
 /* ── Charts Row ────────────────────────────────── */
 .charts-row {
@@ -1131,7 +1132,21 @@ function agentLabel(agent) {
 function agentKey(agent) {
   if (!agent) return 'unknown';
   if (agent.startsWith('cowork')) return 'cowork';
+  if (agent.startsWith('claude-code')) return 'claude-code';
   return agent;
+}
+
+// Returns true if the run label is unhelpful (path fragment, uuid, or "_default")
+function isDefaultLabel(label) {
+  if (!label) return true;
+  if (label === '_default') return true;
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(label)) return true;
+  return false;
+}
+function bestLabel(r) {
+  if (r.ai_title) return r.ai_title;
+  if (r.label && !isDefaultLabel(r.label)) return r.label;
+  return r.id.slice(0, 8);
 }
 
 const STALE_MS = 2 * 60 * 60 * 1000;
@@ -1575,13 +1590,21 @@ function computeOverviewStats() {
   const totalCached = runs.reduce((s,r) => s + (r.cache_read_tokens||0), 0);
   const cacheHit = totalInput > 0 ? (totalCached/totalInput*100).toFixed(1) : '–';
 
+  // Cache savings: what cached reads would have cost at fresh input price minus cache read price
+  let cacheSavedUsd = 0;
+  for (const r of runs) {
+    if (!(r.cache_read_tokens > 0) || isSubscriptionAgent(r.agent)) continue;
+    const p = getPricing(r.model);
+    if (p) cacheSavedUsd += (r.cache_read_tokens / 1e6) * (p.in - p.cr);
+  }
+
   // avg tokens per second (output/duration)
   const doneRuns = runs.filter(r => r.duration_ms && r.output_tokens);
   const avgTps = doneRuns.length > 0
     ? (doneRuns.reduce((s,r) => s + r.output_tokens/(r.duration_ms/1000), 0) / doneRuns.length).toFixed(1)
     : '–';
 
-  return { active, total, totalCost, anyEstimate, totalTokens, cacheHit, avgTps };
+  return { active, total, totalCost, anyEstimate, totalTokens, cacheHit, avgTps, cacheSavedUsd };
 }
 
 function renderOverviewChips() {
@@ -1607,6 +1630,10 @@ function renderOverviewChips() {
     <div class="stat-chip">
       <div class="label">Cache Hit %</div>
       <div class="value orange">${s.cacheHit}${s.cacheHit!=='–'?'%':''}</div>
+    </div>
+    <div class="stat-chip" title="Estimated savings: cached reads billed at cache price vs fresh input price (cache_read_tokens × (input_price − cache_read_price))">
+      <div class="label">Cache Saved <span style="color:var(--text-dim);font-size:9px">~est</span></div>
+      <div class="value teal">${s.cacheSavedUsd > 0 ? '~'+fmtCost(s.cacheSavedUsd) : '–'}</div>
     </div>
     <div class="stat-chip">
       <div class="label">Avg tok/s</div>
@@ -1656,12 +1683,12 @@ function renderOverviewCharts() {
       const barW = (val / maxCost) * bw;
       const y = padT + i * (barH + gap);
       const col = byAgent[a].color;
-      const tip = byAgent[a].sub ? `${a} — subscription billing` : `${a} — ${fmtCost(val)} (${byAgent[a].calls||'?'} runs)`;
+      const tip = byAgent[a].sub ? `${a} — subscription billing · ${fmtNum(byAgent[a].input+byAgent[a].output)} tokens (no per-token charge)` : `${a} — ${fmtCost(val)} (${byAgent[a].calls||'?'} runs)`;
       html += `
         <rect x="${padL}" y="${y}" width="${Math.max(barW,2)}" height="${barH}" fill="${col}" rx="3" opacity=".85"
               onmouseenter="showTip('${escAttr(tip)}',event)" onmouseleave="hideTip()"/>
         <text x="${padL-6}" y="${y+barH/2+4}" text-anchor="end" fill="#8899aa" font-size="11" font-family="var(--font)">${escHtml(a)}</text>
-        <text x="${padL+barW+5}" y="${y+barH/2+4}" fill="${byAgent[a].sub?'#5a6377':'#c9d1e0'}" font-size="11" font-family="var(--font)">${byAgent[a].sub?'sub':fmtCost(val)}</text>
+        <text x="${padL+barW+5}" y="${y+barH/2+4}" fill="${byAgent[a].sub?'#5a6377':'#c9d1e0'}" font-size="11" font-family="var(--font)">${byAgent[a].sub?`sub · ${fmtNum(byAgent[a].input+byAgent[a].output)}t`:fmtCost(val)}</text>
       `;
     });
     $costSvg.innerHTML = html;
@@ -1753,13 +1780,14 @@ function renderRecentRuns() {
         <div class="dur-bar" style="width:${pct}%"></div>
         <div class="status-dot ${runDisplayStatus(r)}"></div>
         <div class="agent-badge" style="background:${agentDim(r.agent)};color:${col}">${escHtml(agentLabel(r.agent))}</div>
-        <div class="run-label">${escHtml(r.label || r.id)}</div>
+        <div class="run-label" style="${isDefaultLabel(r.label)?'color:var(--text-dim)':''}">${escHtml(bestLabel(r))}</div>
         <div class="run-meta">
           <span>${fmtTs(r.started_at)}</span>
           <span class="hi">${fmtDur(r.duration_ms)}</span>
           <span>T:${r.turn_count||0}</span>
           <span>🔧${r.tool_call_count||0}</span>
           <span>${fmtNum((r.input_tokens||0)+(r.output_tokens||0))} tok</span>
+          <span title="Cache hit rate: ${fmtNum(r.cache_read_tokens||0)} read / ${fmtNum((r.input_tokens||0)+(r.cache_read_tokens||0))} input" style="color:var(--teal)">${(r.input_tokens||0)+(r.cache_read_tokens||0)>0?((r.cache_read_tokens||0)/((r.input_tokens||0)+(r.cache_read_tokens||0))*100).toFixed(0)+'%c':'–'}</span>
           <span class="hi" title="${runCostTitle(r)}">${fmtRunCost(r)}</span>
         </div>
       </div>`;
@@ -1827,7 +1855,7 @@ function buildLaneHTML(r) {
       <div class="lane-hdr">
         <div class="status-dot ${runDisplayStatus(r)}"></div>
         <div class="agent-badge" style="background:${agentDim(r.agent)};color:${col}">${escHtml(agentLabel(r.agent))}</div>
-        <div class="run-label">${escHtml(r.label || r.id)}</div>
+        <div class="run-label" style="${isDefaultLabel(r.label)?'color:var(--text-dim)':''}">${escHtml(bestLabel(r))}</div>
         <div class="lane-model">${escHtml(r.model || '')}</div>
         <div class="lane-stats">
           <span>T:<span class="hi">${r.turn_count||0}</span></span>
@@ -1899,11 +1927,12 @@ function renderSessionSidebar() {
     const totalTok = (r.input_tokens||0)+(r.output_tokens||0);
     return `
       <div class="sidebar-run${state.selectedRunId===r.id?' active':''}" data-run-id="${escAttr(r.id)}" onclick="selectSessionRun(this.dataset.runId)">
-        <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
+        <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px;flex-wrap:wrap">
           <div class="status-dot ${runDisplayStatus(r)}"></div>
           <div class="agent-badge" style="background:${agentDim(r.agent)};color:${col};font-size:9px">${escHtml(agentLabel(r.agent))}</div>
+          ${r.agent && r.agent.includes(':') ? `<span style="color:var(--text-dim);font-size:9px;opacity:0.7">${escHtml(r.agent.split(':').slice(1).join(':'))}</span>` : ''}
         </div>
-        <div class="sr-label">${escHtml(r.label || r.id)}</div>
+        <div class="sr-label" style="${isDefaultLabel(r.label)?'color:var(--text-dim)':''}">${escHtml(bestLabel(r))}</div>
         <div class="sr-stats">
           <span>T:${r.turn_count||0}</span>
           <span>🔧${r.tool_call_count||0}</span>
@@ -2519,7 +2548,7 @@ function renderRaceSelect() {
   $sel.innerHTML = sorted.map(r => {
     const totalTok = (r.input_tokens||0) + (r.output_tokens||0) + (r.cache_read_tokens||0);
     const tokLabel = totalTok > 0 ? ` · ${fmtNum(totalTok)} tok` : '';
-    const label = `[${agentLabel(r.agent)}] ${r.label || r.id} (${fmtDur(r.duration_ms)}${tokLabel})`;
+    const label = `[${agentLabel(r.agent)}] ${bestLabel(r)} (${fmtDur(r.duration_ms)}${tokLabel})`;
     const sel = prevSelected.has(r.id) ? 'selected' : '';
     return `<option value="${r.id}" ${sel}>${escHtml(label)}</option>`;
   }).join('');

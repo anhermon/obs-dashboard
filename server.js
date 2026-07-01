@@ -141,6 +141,82 @@ const analyticsStmts = {
     GROUP BY tool_name ORDER BY total_dur_ms DESC LIMIT 30
   `),
   recentRuns: db.prepare(`SELECT ${RUN_SAFE_COLS} FROM runs ORDER BY started_at DESC LIMIT 20`),
+  totalStats: db.prepare(`
+    SELECT
+      COUNT(*) AS runs,
+      COUNT(CASE WHEN input_tokens > 0 OR output_tokens > 0 THEN 1 END) AS sessions_with_tokens,
+      COALESCE(SUM(input_tokens), 0) AS input_tokens,
+      COALESCE(SUM(output_tokens), 0) AS output_tokens,
+      COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+      COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
+      COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens,
+      COALESCE(SUM(cost_usd), 0) AS cost_usd,
+      COUNT(CASE WHEN status = 'running' THEN 1 END) AS active_runs
+    FROM runs
+  `),
+  byAgentDetailed: db.prepare(`
+    SELECT
+      agent,
+      COUNT(*) AS runs,
+      COALESCE(SUM(input_tokens), 0) AS input_tokens,
+      COALESCE(SUM(output_tokens), 0) AS output_tokens,
+      COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+      COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
+      COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens,
+      COALESCE(SUM(cost_usd), 0) AS cost_usd,
+      COUNT(CASE WHEN status = 'running' THEN 1 END) AS active_runs
+    FROM runs GROUP BY agent ORDER BY cost_usd DESC, input_tokens DESC
+  `),
+  topCacheConsumers: db.prepare(`
+    SELECT ${RUN_SAFE_COLS}
+    FROM runs WHERE cache_read_tokens > 0
+    ORDER BY cache_read_tokens DESC LIMIT 5
+  `),
+  dailyTokens: db.prepare(`
+    SELECT
+      date(started_at / 1000, 'unixepoch', 'localtime') AS date,
+      COALESCE(SUM(input_tokens), 0) AS input_tokens,
+      COALESCE(SUM(output_tokens), 0) AS output_tokens,
+      COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+      COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
+      COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens,
+      COUNT(*) AS runs
+    FROM runs
+    WHERE started_at >= ?
+    GROUP BY date ORDER BY date ASC
+  `),
+  agentSummary: db.prepare(`
+    SELECT
+      agent,
+      COUNT(*) AS runs,
+      COALESCE(SUM(input_tokens), 0) AS input_tokens,
+      COALESCE(SUM(output_tokens), 0) AS output_tokens,
+      COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+      COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
+      COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens,
+      COALESCE(SUM(cost_usd), 0) AS cost_usd,
+      COALESCE(SUM(turn_count), 0) AS total_turns,
+      COALESCE(SUM(tool_call_count), 0) AS total_tool_calls,
+      COALESCE(AVG(NULLIF(duration_ms, 0)), 0) AS avg_duration_ms,
+      COUNT(CASE WHEN status = 'running' THEN 1 END) AS active_runs,
+      MAX(started_at) AS last_seen_at
+    FROM runs WHERE agent = ? GROUP BY agent
+  `),
+  agentTopRuns: db.prepare(`
+    SELECT ${RUN_SAFE_COLS} FROM runs WHERE agent = ? ORDER BY started_at DESC LIMIT 10
+  `),
+  agentRecentDailyTokens: db.prepare(`
+    SELECT
+      date(started_at / 1000, 'unixepoch', 'localtime') AS date,
+      COALESCE(SUM(input_tokens), 0) AS input_tokens,
+      COALESCE(SUM(output_tokens), 0) AS output_tokens,
+      COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+      COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
+      COUNT(*) AS runs
+    FROM runs
+    WHERE agent = ? AND started_at >= ?
+    GROUP BY date ORDER BY date ASC
+  `),
 };
 
 // --- Event processor ---
@@ -256,6 +332,192 @@ app.get('/api/analytics', (_req, res) => {
     top_tools:      analyticsStmts.topTools.all(),
     tool_durations: analyticsStmts.toolDurations.all(),
     recent_runs:    analyticsStmts.recentRuns.all(),
+  });
+});
+
+// --- Summary helpers ---
+function cacheHitRate(cache_read, input, cache_write) {
+  const total = (input || 0) + (cache_read || 0) + (cache_write || 0);
+  return total > 0 ? Math.round((cache_read || 0) / total * 10000) / 100 : 0;
+}
+
+function totalTokensForRow(r) {
+  return (r.input_tokens || 0) + (r.output_tokens || 0) +
+    (r.cache_read_tokens || 0) + (r.cache_write_tokens || 0) +
+    (r.reasoning_tokens || 0);
+}
+
+function isSubscriptionAgent(agent) {
+  // claude-code runs under Anthropic Pro/Max subscription — cost_usd not meaningful
+  return agent === 'claude-code' || agent.startsWith('claude-code:') ||
+    agent === 'claude-code:subagent';
+}
+
+function buildOptimizationInsights(total, byAgent) {
+  const insights = [];
+  const globalHitRate = cacheHitRate(total.cache_read_tokens, total.input_tokens, total.cache_write_tokens);
+
+  if (total.sessions_with_tokens === 0) {
+    insights.push({
+      type: 'missing_data',
+      message: 'No token data found. Run the claude-transcript-watcher to backfill usage from transcript files.',
+      impact: 'high',
+    });
+    return insights;
+  }
+
+  if (globalHitRate < 15 && total.cache_write_tokens > 5000) {
+    insights.push({
+      type: 'low_cache_hit_rate',
+      message: `Global cache hit rate is ${globalHitRate.toFixed(1)}%. System prompts are being written to cache but reads are low — consider consolidating repeated context into a single long-lived system prompt.`,
+      impact: 'high',
+    });
+  } else if (globalHitRate >= 50) {
+    insights.push({
+      type: 'good_cache_usage',
+      message: `Cache hit rate is ${globalHitRate.toFixed(1)}% — prompt caching is working well.`,
+      impact: 'low',
+    });
+  }
+
+  if (total.cache_write_tokens === 0 && total.input_tokens > 50000) {
+    insights.push({
+      type: 'no_cache_writes',
+      message: 'No cache writes detected despite high input token volume. Enable prompt caching (cache_control breakpoints) to reduce costs on repeated context.',
+      impact: 'high',
+    });
+  }
+
+  const subagentRows = byAgent.filter(r => r.agent && r.agent.includes('subagent'));
+  if (subagentRows.length > 0) {
+    const subagentRuns = subagentRows.reduce((s, r) => s + r.runs, 0);
+    insights.push({
+      type: 'subagent_activity',
+      message: `${subagentRuns} subagent run(s) detected across ${subagentRows.length} agent variant(s). Subagents share cache with their parent when using the same system prompt.`,
+      impact: 'low',
+    });
+  }
+
+  if (total.reasoning_tokens > 0) {
+    const reasoningPct = Math.round(total.reasoning_tokens / Math.max(total.output_tokens, 1) * 100);
+    if (reasoningPct > 40) {
+      insights.push({
+        type: 'high_reasoning',
+        message: `Reasoning tokens are ${reasoningPct}% of output tokens. Extended thinking is active — review if all tasks require deep reasoning.`,
+        impact: 'medium',
+      });
+    }
+  }
+
+  const agentsWithNoTokens = byAgent.filter(r => r.input_tokens === 0 && r.runs >= 3);
+  if (agentsWithNoTokens.length > 0) {
+    insights.push({
+      type: 'missing_token_data',
+      message: `${agentsWithNoTokens.map(r => r.agent).join(', ')} have runs with no token data. Ensure hooks post after_provider_response events or the transcript watcher is running.`,
+      impact: 'medium',
+    });
+  }
+
+  return insights;
+}
+
+app.get('/api/summary', (_req, res) => {
+  const cutoff14d = Date.now() - 14 * 24 * 60 * 60 * 1000;
+
+  const raw = analyticsStmts.totalStats.get();
+  const total = {
+    runs: raw.runs,
+    sessions_with_tokens: raw.sessions_with_tokens,
+    input_tokens: raw.input_tokens,
+    output_tokens: raw.output_tokens,
+    cache_read_tokens: raw.cache_read_tokens,
+    cache_write_tokens: raw.cache_write_tokens,
+    reasoning_tokens: raw.reasoning_tokens,
+    total_tokens: totalTokensForRow(raw),
+    cache_hit_rate_pct: cacheHitRate(raw.cache_read_tokens, raw.input_tokens, raw.cache_write_tokens),
+    cost_usd: raw.cost_usd,
+    active_runs: raw.active_runs,
+  };
+
+  const byAgentRaw = analyticsStmts.byAgentDetailed.all();
+  const by_agent = byAgentRaw.map(r => ({
+    agent: r.agent,
+    runs: r.runs,
+    input_tokens: r.input_tokens,
+    output_tokens: r.output_tokens,
+    cache_read_tokens: r.cache_read_tokens,
+    cache_write_tokens: r.cache_write_tokens,
+    reasoning_tokens: r.reasoning_tokens,
+    total_tokens: totalTokensForRow(r),
+    cache_hit_rate_pct: cacheHitRate(r.cache_read_tokens, r.input_tokens, r.cache_write_tokens),
+    cost_usd: r.cost_usd,
+    active_runs: r.active_runs,
+    is_subscription: isSubscriptionAgent(r.agent),
+  }));
+
+  const top_cache_consumers = analyticsStmts.topCacheConsumers.all().map(r => ({
+    ...r,
+    cache_hit_rate_pct: cacheHitRate(r.cache_read_tokens, r.input_tokens, r.cache_write_tokens),
+  }));
+
+  const cache_efficiency_by_agent = by_agent
+    .filter(r => r.cache_read_tokens > 0 || r.cache_write_tokens > 0)
+    .map(r => ({
+      agent: r.agent,
+      cache_read_tokens: r.cache_read_tokens,
+      cache_write_tokens: r.cache_write_tokens,
+      cache_hit_rate_pct: r.cache_hit_rate_pct,
+      runs: r.runs,
+    }))
+    .sort((a, b) => b.cache_hit_rate_pct - a.cache_hit_rate_pct);
+
+  const daily_tokens = analyticsStmts.dailyTokens.all(cutoff14d);
+
+  const optimization_insights = buildOptimizationInsights(total, byAgentRaw);
+
+  res.json({
+    generated_at: Date.now(),
+    total,
+    by_agent,
+    top_cache_consumers,
+    cache_efficiency_by_agent,
+    daily_tokens,
+    optimization_insights,
+  });
+});
+
+app.get('/api/agent/:agent', (req, res) => {
+  const agent = req.params.agent;
+  const cutoff14d = Date.now() - 14 * 24 * 60 * 60 * 1000;
+
+  const summary = analyticsStmts.agentSummary.get(agent);
+  if (!summary) return res.status(404).json({ error: `No runs found for agent: ${agent}` });
+
+  const top_runs = analyticsStmts.agentTopRuns.all(agent);
+  const daily_tokens = analyticsStmts.agentRecentDailyTokens.all(agent, cutoff14d);
+
+  const cache_hit_rate_pct = cacheHitRate(
+    summary.cache_read_tokens, summary.input_tokens, summary.cache_write_tokens
+  );
+
+  res.json({
+    generated_at: Date.now(),
+    agent,
+    summary: {
+      ...summary,
+      total_tokens: totalTokensForRow(summary),
+      cache_hit_rate_pct,
+      is_subscription: isSubscriptionAgent(agent),
+    },
+    top_runs: top_runs.map(r => ({
+      ...r,
+      cache_hit_rate_pct: cacheHitRate(r.cache_read_tokens, r.input_tokens, r.cache_write_tokens),
+    })),
+    daily_tokens,
+    optimization_insights: buildOptimizationInsights(
+      { ...summary, sessions_with_tokens: summary.runs, active_runs: summary.active_runs },
+      [summary]
+    ),
   });
 });
 
