@@ -2261,7 +2261,7 @@ function buildTokenFlowHTML(run, events) {
       html += `<rect x="${x}" y="${y}" width="${barW}" height="${cachedH}" fill="#2a4070" rx="0"/>`;
     }
 
-    html += `<text x="${x + barW/2}" y="${svgH - 4}" text-anchor="middle" fill="#5a6377" font-size="9" font-family="var(--font)">T${t.turn}</text>`;
+    html += `<text x="${x + barW/2}" y="${svgH - 4}" text-anchor="middle" fill="#5a6377" font-size="9" font-family="var(--font)">T${i+1}</text>`;
   });
 
   html += '</svg></div></div>';
