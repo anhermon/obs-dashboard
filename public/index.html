@@ -1588,7 +1588,7 @@ function computeOverviewStats() {
   const totalTokens = runs.reduce((s,r) => s + (r.input_tokens||0) + (r.output_tokens||0), 0);
   const totalInput = runs.reduce((s,r) => s + (r.input_tokens||0), 0);
   const totalCached = runs.reduce((s,r) => s + (r.cache_read_tokens||0), 0);
-  const cacheHit = totalInput > 0 ? (totalCached/totalInput*100).toFixed(1) : '–';
+  const cacheHit = (totalInput + totalCached) > 0 ? (totalCached/(totalInput+totalCached)*100).toFixed(1) : '–';
 
   // Cache savings: what cached reads would have cost at fresh input price minus cache read price
   let cacheSavedUsd = 0;

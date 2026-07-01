@@ -4,3 +4,6 @@ node_modules/
 *.db
 *.db-shm
 *.db-wal
+
+# Watcher runtime state (byte offsets, seen message IDs)
+watchers/.transcript-watcher-state.json

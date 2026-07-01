@@ -99,7 +99,7 @@ const stmts = {
   incrementToolCalls:db.prepare(`UPDATE runs SET tool_call_count = tool_call_count + 1 WHERE id = ?`),
   incrementEvents:   db.prepare(`UPDATE runs SET event_count = event_count + 1 WHERE id = ?`),
   insertEvent:       db.prepare(`INSERT INTO events (run_id, type, ts, seq, data) VALUES (?, ?, ?, ?, ?)`),
-  getRuns:           db.prepare(`SELECT ${RUN_SAFE_COLS} FROM runs ORDER BY started_at DESC LIMIT 200`),
+  getRuns:           db.prepare(`SELECT ${RUN_SAFE_COLS} FROM runs ORDER BY started_at DESC LIMIT 500`),
   getRun:            db.prepare(`SELECT * FROM runs WHERE id = ?`),
   getRunSafe:        db.prepare(`SELECT ${RUN_SAFE_COLS} FROM runs WHERE id = ?`),
   getEvents:         db.prepare(`SELECT * FROM events WHERE run_id = ? ORDER BY seq ASC`),
