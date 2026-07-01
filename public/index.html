@@ -301,6 +301,7 @@ button.btn.danger:hover { background: #2a1010; }
 }
 .status-dot.running { background: var(--green); box-shadow: 0 0 5px var(--green); animation: pulse 1.5s infinite; }
 .status-dot.done    { background: var(--text-dim); }
+.status-dot.stale   { background: #3a4560; }
 
 @keyframes pulse {
   0%,100% { opacity:1; } 50% { opacity:.4; }
@@ -1133,6 +1134,12 @@ function agentKey(agent) {
   return agent;
 }
 
+const STALE_MS = 2 * 60 * 60 * 1000;
+function runDisplayStatus(r) {
+  if (r.status === 'running' && (Date.now() - r.started_at) > STALE_MS) return 'stale';
+  return r.status;
+}
+
 function fmtMs(ms) {
   if (ms == null) return '–';
   if (ms < 1000) return ms + 'ms';
@@ -1546,7 +1553,9 @@ async function renderRtkCard() {
 
 function computeOverviewStats() {
   const runs = state.runs;
-  const active = runs.filter(r => r.status === 'running').length;
+  const STALE_AFTER_MS = 2 * 60 * 60 * 1000; // 2 hours
+  const now = Date.now();
+  const active = runs.filter(r => r.status === 'running' && (now - r.started_at) < STALE_AFTER_MS).length;
   const total = runs.length;
   const totalCost = runs.reduce((s,r) => { const i=runCostInfo(r); return s + (i.isSubscription ? 0 : (i.cost||0)); }, 0);
   const anyEstimate = runs.some(r => runCostInfo(r).isEstimate);
@@ -1728,7 +1737,7 @@ function renderRecentRuns() {
     return `
       <div class="run-row" onclick="openSession('${r.id}')">
         <div class="dur-bar" style="width:${pct}%"></div>
-        <div class="status-dot ${r.status}"></div>
+        <div class="status-dot ${runDisplayStatus(r)}"></div>
         <div class="agent-badge" style="background:${agentDim(r.agent)};color:${col}">${agentLabel(r.agent)}</div>
         <div class="run-label">${r.label || r.id}</div>
         <div class="run-meta">
@@ -1802,7 +1811,7 @@ function buildLaneHTML(r) {
   return `
     <div class="lane${state.selectedRunId===r.id?' selected':''}" id="lane-${r.id}" onclick="openSession('${r.id}')">
       <div class="lane-hdr">
-        <div class="status-dot ${r.status}"></div>
+        <div class="status-dot ${runDisplayStatus(r)}"></div>
         <div class="agent-badge" style="background:${agentDim(r.agent)};color:${col}">${agentLabel(r.agent)}</div>
         <div class="run-label">${r.label || r.id}</div>
         <div class="lane-model">${r.model || ''}</div>
@@ -1882,7 +1891,7 @@ function renderSessionSidebar() {
     return `
       <div class="sidebar-run${state.selectedRunId===r.id?' active':''}" onclick="selectSessionRun('${r.id}')">
         <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
-          <div class="status-dot ${r.status}"></div>
+          <div class="status-dot ${runDisplayStatus(r)}"></div>
           <div class="agent-badge" style="background:${agentDim(r.agent)};color:${col};font-size:9px">${agentLabel(r.agent)}</div>
         </div>
         <div class="sr-label">${r.label || r.id}</div>
@@ -2591,7 +2600,7 @@ async function renderRaceColumns(ids) {
       <div class="race-col">
         <div class="race-col-hdr">
           <div style="display:flex;align-items:center;gap:6px">
-            <div class="status-dot ${run.status}"></div>
+            <div class="status-dot ${runDisplayStatus(run)}"></div>
             <div class="agent-badge" style="background:${agentDim(run.agent)};color:${col}">${agentLabel(run.agent)}</div>
           </div>
           <div style="font-size:11px;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(run.label||run.id)}</div>
